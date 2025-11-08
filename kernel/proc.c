@@ -8,6 +8,8 @@
 #include "file.h"
 #include "proc.h"
 #include "defs.h"
+#include "rcu.h"
+#include <stddef.h>
 
 struct cpu cpus[NCPU];
 
@@ -689,4 +691,55 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+// simple data structure used by the RCU test
+struct test_data {
+  int value;
+  struct rcu_head rcu;
+};
+
+// callback executed after grace period
+static void
+rcu_free_callback(struct rcu_head *head)
+{
+  struct test_data *d =
+      (struct test_data *)((char *)head - offsetof(struct test_data, rcu));
+  printf("[callback] free old value=%d\n", d->value);
+  kfree((char *)d);
+}
+
+// main RCU test function
+void
+test_rcu(void)
+{
+  printf("=== RCU test start ===\n");
+
+  static struct test_data *global = 0;
+
+  // create first object
+  struct test_data *d1 = kalloc();
+  d1->value = 100;
+  global = d1;
+  printf("[init] global value=%d\n", global->value);
+
+  // reader section
+  rcu_read_lock();
+  struct test_data *local = global;
+  printf("[reader] read value=%d\n", local->value);
+  rcu_read_unlock();
+
+  // writer creates new version
+  struct test_data *d2 = kalloc();
+  d2->value = 200;
+  struct test_data *old = global;
+  global = d2;
+  printf("[writer] updated global to %d\n", global->value);
+
+  // schedule deferred free
+  call_rcu(&old->rcu, rcu_free_callback);
+
+  // wait until all readers finish, then run callback
+  synchronize_rcu();
+
+  printf("=== RCU test done ===\n");
 }
