@@ -10,7 +10,7 @@
 #include "defs.h"
 #include "rcu.h"
 #include <stddef.h>
-
+#include "rcu_hash.h"
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -484,6 +484,7 @@ scheduler(void)
       release(&p->lock);
     }
     if(found == 0){
+      rcu_poll();
       asm volatile("wfi");
     }
   }
@@ -692,54 +693,124 @@ procdump(void)
     printf("\n");
   }
 }
-// simple data structure used by the RCU test
+// Simple data structure used by the RCU test.
 struct test_data {
   int value;
   struct rcu_head rcu;
 };
 
-// callback executed after grace period
+// Helper: get struct test_data* from rcu_head* (like container_of).
+static struct test_data *
+rcu_to_test_data(struct rcu_head *head)
+{
+  return (struct test_data *)((char *)head
+          - (uint64)(&((struct test_data *)0)->rcu));
+}
+
+// Callback executed after the grace period.
 static void
 rcu_free_callback(struct rcu_head *head)
 {
-  struct test_data *d =
-      (struct test_data *)((char *)head - offsetof(struct test_data, rcu));
+  struct test_data *d = rcu_to_test_data(head);
   printf("[callback] free old value=%d\n", d->value);
   kfree((char *)d);
 }
 
-// main RCU test function
+// Global RCU-protected pointer.
+static struct test_data *global = 0;
+
+// Main RCU test function.
 void
 test_rcu(void)
 {
   printf("=== RCU test start ===\n");
 
-  static struct test_data *global = 0;
-
-  // create first object
-  struct test_data *d1 = kalloc();
+  // Create first object and publish it.
+  struct test_data *d1 = (struct test_data *)kalloc();
+  if (d1 == 0) {
+    printf("kalloc failed\n");
+    return;
+  }
   d1->value = 100;
-  global = d1;
+  rcu_assign_pointer(global, d1);
   printf("[init] global value=%d\n", global->value);
 
-  // reader section
+  // Reader section.
   rcu_read_lock();
-  struct test_data *local = global;
+  struct test_data *local = rcu_dereference(global);
   printf("[reader] read value=%d\n", local->value);
   rcu_read_unlock();
 
-  // writer creates new version
-  struct test_data *d2 = kalloc();
+  // Writer creates a new version.
+  struct test_data *d2 = (struct test_data *)kalloc();
+  if (d2 == 0) {
+    printf("kalloc failed\n");
+    return;
+  }
   d2->value = 200;
+
+  // Swap pointer and keep the old one.
   struct test_data *old = global;
-  global = d2;
+  rcu_assign_pointer(global, d2);
   printf("[writer] updated global to %d\n", global->value);
 
-  // schedule deferred free
+  // Schedule deferred free of the old object.
   call_rcu(&old->rcu, rcu_free_callback);
 
-  // wait until all readers finish, then run callback
-  synchronize_rcu();
 
   printf("=== RCU test done ===\n");
 }
+
+// // Global RCU-protected hash table for the test.
+// static struct rcu_hash_table ht;
+
+// // Simple test for RCU hash table.
+// void
+// test_rcu_hash(void)
+// {
+//   printf("=== RCU hash test start ===\n");
+
+//   rcu_hash_init(&ht);
+
+//   // Insert some key/value pairs.
+//   for (int i = 0; i < 10; i++) {
+//     int r = rcu_hash_insert(&ht, i, i * 10);
+//     if (r != 0)
+//       printf("[insert] key=%d failed\n", i);
+//   }
+
+//   // Read them inside an RCU read-side critical section.
+//   rcu_read_lock();
+//   for (int i = 0; i < 10; i++) {
+//     uint64 v;
+//     if (rcu_hash_lookup(&ht, i, &v)) {
+//       printf("[lookup] key=%d value=%d\n", i, (int)v);
+//     } else {
+//       printf("[lookup] key=%d not found\n", i);
+//     }
+//   }
+//   rcu_read_unlock();
+
+//   // Remove some keys.
+//   for (int i = 0; i < 5; i++) {
+//     int r = rcu_hash_remove(&ht, i);
+//     printf("[remove] key=%d %s\n", i, r ? "removed" : "not found");
+//   }
+
+//   // After synchronize_rcu, callbacks will run and free removed nodes.
+//   synchronize_rcu();
+
+//   // Check again what remains.
+//   rcu_read_lock();
+//   for (int i = 0; i < 10; i++) {
+//     uint64 v;
+//     if (rcu_hash_lookup(&ht, i, &v)) {
+//       printf("[after] key=%d value=%d\n", i, (int)v);
+//     } else {
+//       printf("[after] key=%d not found\n", i);
+//     }
+//   }
+//   rcu_read_unlock();
+
+//   printf("=== RCU hash test done ===\n");
+// }

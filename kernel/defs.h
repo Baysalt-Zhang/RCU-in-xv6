@@ -207,7 +207,7 @@ void lst_print(struct list*);
 int lst_empty(struct list*);
 
 // extra files for lab net
-
+void rcu_poll(void);
 // net.c
 void            netinit(void);
 int             nettimer(void);
@@ -216,3 +216,4 @@ int             nettimer(void);
 void            virtio_net_init(void *);
 int             virtio_net_send(const void *data, int len);
 int             virtio_net_recv(void *data, int len);
+

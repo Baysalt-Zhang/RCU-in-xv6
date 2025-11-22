@@ -7,7 +7,9 @@
 #include "fs.h"
 #include "file.h"
 #include "defs.h"
+#include "rcu.h"
 extern void test_rcu(void);
+extern void rcu_worker(void);
 volatile static int started = 0;
 
 // start() jumps here in supervisor mode on all CPUs.
@@ -32,8 +34,14 @@ main()
     iinit();         // inode cache
     fileinit();      // file table
     virtio_disk_init(); // emulated hard disk
-    userinit();      // first user process
+
+    // Initialize RCU subsystem.
+    rcu_init();
+
+    // Optionally run the simple RCU test once at boot.
     test_rcu();
+    userinit();      // first user process
+
     __sync_synchronize();
     started = 1;
   } else {
