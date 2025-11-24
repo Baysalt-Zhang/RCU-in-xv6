@@ -38,3 +38,8 @@ entry("sleep");
 entry("uptime");
 entry("ntas");
 entry("nfree");
+entry("test_rcu");
+entry("rcu_read_only");
+entry("rcu_read_heavy");
+entry("rcu_read_write_mix");
+entry("rcu_read_stress");

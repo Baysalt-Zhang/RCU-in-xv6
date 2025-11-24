@@ -32,7 +32,8 @@ OBJS = \
   $K/buddy.o \
   $K/list.o \
   $K/rcu.o \
-  $K/rcu_hash.o
+  $K/rcu_hash.o \
+    $K/rcutest.o
 
 # riscv64-unknown-elf- or riscv64-linux-gnu-
 # perhaps in /opt/riscv/bin
@@ -150,6 +151,11 @@ UPROGS=\
 	$U/_alloctest\
 	$U/_specialtest\
 	$U/_umalloc\
+		$U/_test_rcu \
+	$U/_rcu_read_only \
+	$U/_rcu_read_heavy \
+	$U/_rcu_read_write_mix \
+	$U/_rcu_read_stress \
 	# $U/_threadtest\
 	# $U/_symlinktest\
 	# $U/_largefiletest\
