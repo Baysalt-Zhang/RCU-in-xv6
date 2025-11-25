@@ -7,6 +7,64 @@
 #include "proc.h"
 #include "rcu.h"
 
+struct rwlock {
+  struct spinlock lock;
+  int readers;
+  int writer;   // 0 = no writer, 1 = writer holds the lock
+};
+
+void
+rwlock_init(struct rwlock *lk, char *name)
+{
+  initlock(&lk->lock, name);
+  lk->readers = 0;
+  lk->writer = 0;
+}
+
+void
+rlock(struct rwlock *lk)
+{
+  for (;;) {
+    acquire(&lk->lock);
+    if (lk->writer == 0) {
+      lk->readers++;
+      release(&lk->lock);
+      break;
+    }
+    release(&lk->lock);
+    // busy-wait; good enough for a microbenchmark
+  }
+}
+
+void
+runlock(struct rwlock *lk)
+{
+  acquire(&lk->lock);
+  lk->readers--;
+  release(&lk->lock);
+}
+
+void
+wlock(struct rwlock *lk)
+{
+  for (;;) {
+    acquire(&lk->lock);
+    if (lk->writer == 0 && lk->readers == 0) {
+      lk->writer = 1;
+      release(&lk->lock);
+      break;
+    }
+    release(&lk->lock);
+  }
+}
+
+void
+wunlock(struct rwlock *lk)
+{
+  acquire(&lk->lock);
+  lk->writer = 0;
+  release(&lk->lock);
+}
 uint64 rcu_callback_counter = 0;
 double read_only_avg_latency = 0; // 来自 rcu_read_only()
 
@@ -30,7 +88,7 @@ rcu_free_callback(struct rcu_head *head)
 {
     rcu_callback_counter++;
     struct test_data *d = rcu_to_test_data(head);
-    // printf("[callback] free old value=%d\n", d->value);
+    printf("[callback] free old value=%d\n", d->value);
     kfree((char *)d);
 }
 
@@ -106,70 +164,134 @@ void rcu_read_only(void)
     }
 }
 
-void rcu_read_heavy(void)
+void
+rcu_read_heavy(void)
 {
-    printf("=== RCU read-heavy test ===\n");
+  // -------------------------------
+  // Part 1: RCU read-heavy test
+  // -------------------------------
+  printf("=== RCU read-heavy test ===\n");
 
-    // evaluation
-    uint64 read_count = 0;
-    uint64 write_count = 0;
-    uint64 callback_count_before = rcu_callback_counter;
-    uint64 start = ticks;
+  // reset global pointer for the test
+  global_test_ptr = 0;
 
-    // run test for at least 10 ticks (~100ms) to get meaningful data
-    uint64 now = start;
-    while (now - start < 10)
-    {
+  uint64 read_count = 0;
+  uint64 write_count = 0;
+  uint64 callback_before = rcu_callback_counter;
+  uint64 start = ticks;
+  uint64 now = start;
 
-        // reader
-        rcu_read_lock();
-        struct test_data *p = rcu_dereference(global_test_ptr);
-        if (p)
-        {
-            int v = p->value;
-            (void)v;
+  // run the test for at least 10 ticks
+  while (now - start < 10) {
+    // RCU reader: lock, dereference, unlock
+    rcu_read_lock();
+    struct test_data *p = rcu_dereference(global_test_ptr);
+    if (p) {
+      int v = p->value;
+      (void)v;
+    }
+    rcu_read_unlock();
+    read_count++;
+
+    // occasional writer: publish a new object
+    if (read_count % 5000 == 0) {
+      struct test_data *d = (struct test_data *)kalloc();
+      if (d) {
+        d->value = (int)read_count;
+        struct test_data *old = global_test_ptr;
+        rcu_assign_pointer(global_test_ptr, d);
+        if (old != 0) {
+          call_rcu(&old->rcu, rcu_free_callback);
+          write_count++;
         }
-        rcu_read_unlock();
-        read_count++;
-
-        // writer occasionally
-        if (read_count % 5000 == 0)
-        {
-            struct test_data *d = kalloc();
-            d->value = read_count;
-            struct test_data *old = global_test_ptr;
-            rcu_assign_pointer(global_test_ptr, d);
-            if (old != 0)
-            {
-                call_rcu(&old->rcu, rcu_free_callback);
-                write_count++;
-            }
-        }
-        now = ticks;
+      }
     }
 
-    uint64 duration = now - start;
-    uint64 callback_count_after = rcu_callback_counter;
-    uint64 callbacks_executed = callback_count_after - callback_count_before;
+    // let scheduler/idle path run RCU callbacks
+    rcu_poll();
 
-    printf("read-heavy test done\n");
-    printf("Duration: %u ticks\n", duration);
-    printf("Total reads: %u\n", read_count);
-    printf("Total writes: %u\n", write_count);
-    printf("Callbacks executed: %u\n", callbacks_executed);
+    now = ticks;
+  }
 
-    printf("Reads per tick: %u\n", read_count / duration);
-    printf("Writes per tick: %u\n", write_count / duration);
+  uint64 duration = now - start;
+  uint64 callback_after = rcu_callback_counter;
+  uint64 callbacks_executed = callback_after - callback_before;
 
-    printf("Average ticks per read: %f\n",
-           (double)duration / (double)read_count);
+  printf("[RCU] duration ticks: %d\n", (int)duration);
+  printf("[RCU] total reads : %d\n", (int)read_count);
+  printf("[RCU] total writes: %d\n", (int)write_count);
+  printf("[RCU] callbacks executed: %d\n", (int)callbacks_executed);
 
-    if (write_count > 0)
-    {
-        printf("Average callbacks per write: %f\n",
-               (double)callbacks_executed / (double)write_count);
+  if (duration > 0) {
+    printf("[RCU] reads per tick : %d\n",
+           (int)(read_count / duration));
+    printf("[RCU] writes per tick: %d\n",
+           (int)(write_count / duration));
+  }
+
+  // -------------------------------
+  // Part 2: RW-lock read-heavy test
+  // -------------------------------
+  printf("=== RW-lock read-heavy test ===\n");
+
+  // test pointer protected by rwlock
+  static struct test_data *rw_ptr = 0;
+  static struct rwlock rw;
+
+  rwlock_init(&rw, "rwbench");
+  rw_ptr = 0;
+
+  uint64 rw_read_count = 0;
+  uint64 rw_write_count = 0;
+  uint64 start2 = ticks;
+  uint64 now2 = start2;
+
+  while (now2 - start2 < 10) {
+    // reader: shared lock
+    rlock(&rw);
+    struct test_data *p2 = rw_ptr;
+    if (p2) {
+      int v2 = p2->value;
+      (void)v2;
     }
+    runlock(&rw);
+    rw_read_count++;
+
+    // occasional writer: exclusive lock
+    if (rw_read_count % 5000 == 0) {
+      wlock(&rw);
+      struct test_data *d2 = (struct test_data *)kalloc();
+      if (d2) {
+        d2->value = (int)rw_read_count;
+        struct test_data *old2 = rw_ptr;
+        rw_ptr = d2;
+        if (old2) {
+          kfree((char *)old2);  // no RCU, safe after exclusive lock
+          rw_write_count++;
+        }
+      }
+      wunlock(&rw);
+    }
+
+    now2 = ticks;
+  }
+
+  uint64 duration2 = now2 - start2;
+
+  printf("[RW ] duration ticks: %d\n", (int)duration2);
+  printf("[RW ] total reads : %d\n", (int)rw_read_count);
+  printf("[RW ] total writes: %d\n", (int)rw_write_count);
+
+  if (duration2 > 0) {
+    printf("[RW ] reads per tick : %d\n",
+           (int)(rw_read_count / duration2));
+    printf("[RW ] writes per tick: %d\n",
+           (int)(rw_write_count / duration2));
+  }
+
+  printf("=== read-heavy comparison done ===\n");
 }
+
 
 static struct test_data *mix_test_ptr = 0;
 

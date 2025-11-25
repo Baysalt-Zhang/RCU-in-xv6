@@ -36,10 +36,10 @@ void main()
     virtio_disk_init(); // emulated hard disk
 
     // // Initialize RCU subsystem.
-    // rcu_init();
+    rcu_init();
 
     // // Optionally run the simple RCU test once at boot.
-    // test_rcu();
+    test_rcu();
     userinit(); // first user process
 
     __sync_synchronize();
